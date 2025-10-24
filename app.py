@@ -166,6 +166,99 @@ def _centroid(bbox):
     return ((x_min + x_max) / 2.0, (y_min + y_max) / 2.0)
 
 
+def _bbox_from_hand_landmarks(hand_landmarks, frame_w, frame_h, pad=0.05):
+    """Return bbox (x_min,y_min,x_max,y_max) in absolute pixel coords from MediaPipe hand landmarks.
+
+    Adds a small padding (fraction of box size) to give room for drawing and matching.
+    """
+    try:
+        landmarks = np.array([[lm.x * frame_w, lm.y * frame_h] for lm in hand_landmarks.landmark])
+        x_min, y_min = np.min(landmarks, axis=0).astype(int)
+        x_max, y_max = np.max(landmarks, axis=0).astype(int)
+        w = x_max - x_min
+        h = y_max - y_min
+        pad_x = int(w * pad)
+        pad_y = int(h * pad)
+        x_min = max(0, x_min - pad_x)
+        y_min = max(0, y_min - pad_y)
+        x_max = min(frame_w - 1, x_max + pad_x)
+        y_max = min(frame_h - 1, y_max + pad_y)
+        return (x_min, y_min, x_max, y_max)
+    except Exception:
+        return None
+
+
+def detect_fingers(hand_landmarks, handedness_label=None, thumb_angle_threshold=150.0, distance_ratio_threshold=0.25):
+    """Return per-finger boolean extended states and a count.
+
+    Strategy:
+    - For index/middle/ring/pinky: use simple tip vs pip y-position (image coords), plus relative distance from wrist.
+    - For thumb: use the angle heuristic at thumb IP joint and a small distance check to avoid false positives.
+
+    Returns: (states_dict, count)
+    where states_dict = {'thumb':bool, 'index':bool, 'middle':bool, 'ring':bool, 'pinky':bool}
+    """
+    lm = hand_landmarks.landmark
+    states = {f: False for f in ['thumb', 'index', 'middle', 'ring', 'pinky']}
+
+    # Wrist-based distance normalization
+    try:
+        wrist = lm[0]
+        # Use distance between wrist and middle_finger_mcp as a rough hand size
+        size_ref = np.hypot(lm[9].x - wrist.x, lm[9].y - wrist.y)
+        size_ref = max(size_ref, 1e-6)
+    except Exception:
+        size_ref = 1.0
+
+    # Fingers: (tip, pip, mcp indexes)
+    finger_idxs = {
+        'index': (8, 6, 5),
+        'middle': (12, 10, 9),
+        'ring': (16, 14, 13),
+        'pinky': (20, 18, 17)
+    }
+
+    for name, (tip_i, pip_i, mcp_i) in finger_idxs.items():
+        try:
+            tip = lm[tip_i]
+            pip = lm[pip_i]
+            mcp = lm[mcp_i]
+            # image y: smaller is up. Extended if tip is above pip and the tip is sufficiently far from wrist
+            vertical_ok = tip.y < pip.y
+            dist = np.hypot(tip.x - wrist.x, tip.y - wrist.y)
+            size_ok = (dist / size_ref) > distance_ratio_threshold
+            states[name] = bool(vertical_ok and size_ok)
+        except Exception:
+            states[name] = False
+
+    # Thumb: indexes 2 (mcp), 3 (ip), 4 (tip)
+    try:
+        angle = _angle_between(lm[2], lm[3], lm[4])
+        # distance between thumb tip and thumb mcp normalized
+        dist_thumb = np.hypot(lm[4].x - lm[2].x, lm[4].y - lm[2].y)
+        size_ok = (dist_thumb / size_ref) > (distance_ratio_threshold * 0.6)
+        states['thumb'] = (angle >= thumb_angle_threshold) and size_ok
+        # fallback: for some poses, angle can be small but x-offset indicates extension (handedness-sensitive)
+        if not states['thumb']:
+            try:
+                if handedness_label is not None:
+                    # After horizontal flip, handedness may be in camera view. Use approximate heuristic:
+                    if handedness_label.lower().startswith('right'):
+                        states['thumb'] = lm[4].x < lm[2].x and size_ok
+                    else:
+                        states['thumb'] = lm[4].x > lm[2].x and size_ok
+                else:
+                    # generic X separation fallback
+                    states['thumb'] = abs(lm[4].x - lm[2].x) > (distance_ratio_threshold * 0.6) and size_ok
+            except Exception:
+                pass
+    except Exception:
+        states['thumb'] = False
+
+    count = sum(1 for v in states.values() if v)
+    return states, int(count)
+
+
 
 def count_extended_fingers(hand_landmarks, handedness_label=None, thumb_angle_threshold=150.0):
     """Return an approximate number of extended fingers for a single hand.
@@ -260,6 +353,9 @@ def run_hand_detector(camera_index=0):
     # Storage for per-face tracking and smoothing
     tracked_faces = {}  # id -> {bbox: (x1,y1,x2,y2), last_seen: frame_idx, score: float}
     next_face_id = 1
+    # Storage for per-hand tracking and per-finger smoothing
+    tracked_hands = {}  # id -> {bbox, last_seen, label, finger_buffers: {finger: deque}}
+    next_hand_id = 1
     frame_idx = 0
     track_alpha = 0.6  # EMA factor for smoothing bbox updates
     track_max_age = 10  # frames before a track is removed
@@ -267,6 +363,10 @@ def run_hand_detector(camera_index=0):
     last_sound_time = 0  # Track when the last sound was played
     sound_cooldown = 0.5  # Cooldown period in seconds
     previous_hand_count = 0  # Track the previous (stable) number of hands
+    # Face sound tracking
+    last_face_sound_time = 0
+    face_sound_cooldown = 0.5
+    previous_face_count = 0
 
     # Buffer for temporal smoothing of detected hand counts
     stable_buffer = deque(maxlen=5)  # keep last 5 frames
@@ -361,11 +461,13 @@ def run_hand_detector(camera_index=0):
         cv2.putText(frame, count_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
                     0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
-        # Count open/closed hands and draw landmarks
+        # Count open/closed hands and draw landmarks (with per-finger smoothing)
         open_hands = 0
         closed_hands = 0
+
+        # Prepare detected hands list
+        detections_hands = []
         if results.multi_hand_landmarks:
-            # If MediaPipe provides handedness, zip to keep them aligned
             handedness_list = results.multi_handedness if getattr(results, 'multi_handedness', None) else []
             for i, hand_landmarks in enumerate(results.multi_hand_landmarks):
                 handedness_label = None
@@ -375,20 +477,123 @@ def run_hand_detector(camera_index=0):
                 except Exception:
                     handedness_label = None
 
-                # Calculate confidence based on landmark positions (z mean heuristic)
+                # confidence heuristic
                 try:
                     confidence = 100 * min(max(np.mean([lm.z for lm in hand_landmarks.landmark]) + 0.5, 0), 1)
                 except Exception:
                     confidence = None
 
-                # Determine number of extended fingers and classify open/closed
-                fingers = count_extended_fingers(hand_landmarks, handedness_label, thumb_angle_threshold)
-                if fingers >= 4:
-                    open_hands += 1
-                elif fingers <= 1:
-                    closed_hands += 1
+                bbox_px = _bbox_from_hand_landmarks(hand_landmarks, frame.shape[1], frame.shape[0])
+                if bbox_px is None:
+                    # fallback: approximate from landmarks
+                    landmarks = np.array([[lm.x * frame.shape[1], lm.y * frame.shape[0]] for lm in hand_landmarks.landmark])
+                    x_min, y_min = np.min(landmarks, axis=0).astype(int)
+                    x_max, y_max = np.max(landmarks, axis=0).astype(int)
+                    bbox_px = (x_min, y_min, x_max, y_max)
 
-                draw_hand_landmarks(frame, hand_landmarks, confidence)
+                detections_hands.append({
+                    'landmarks': hand_landmarks,
+                    'handedness': handedness_label,
+                    'bbox': bbox_px,
+                    'confidence': confidence
+                })
+
+        # Match detected hands to existing tracks (greedy nearest-centroid)
+        unmatched_tracks = set(tracked_hands.keys())
+        assigned_tracks = set()
+        match_threshold = max(frame.shape[0], frame.shape[1]) * 0.18  # px
+
+        for det in detections_hands:
+            dbbox = det['bbox']
+            dcent = _centroid(dbbox)
+            best_id = None
+            best_dist = float('inf')
+            for hid in list(unmatched_tracks):
+                tcent = _centroid(tracked_hands[hid]['bbox'])
+                dist = np.hypot(tcent[0] - dcent[0], tcent[1] - dcent[1])
+                if dist < best_dist:
+                    best_dist = dist
+                    best_id = hid
+
+            if best_id is not None and best_dist <= match_threshold:
+                # update tracked hand
+                old_bbox = tracked_hands[best_id]['bbox']
+                new_bbox = tuple([int((1 - track_alpha) * old_bbox[i] + track_alpha * dbbox[i]) for i in range(4)])
+                tracked_hands[best_id]['bbox'] = new_bbox
+                tracked_hands[best_id]['last_seen'] = frame_idx
+                tracked_hands[best_id]['label'] = det.get('handedness')
+                # update finger buffers
+                states, cnt = detect_fingers(det['landmarks'], det.get('handedness'), thumb_angle_threshold)
+                for fname, val in states.items():
+                    tracked_hands[best_id]['finger_buffers'][fname].append(int(bool(val)))
+                assigned_tracks.add(best_id)
+                unmatched_tracks.discard(best_id)
+                # draw using the original hand landmarks for visuals
+                draw_hand_landmarks(frame, det['landmarks'], det.get('confidence'))
+                # draw per-finger tip markers
+                try:
+                    lm = det['landmarks'].landmark
+                    # mapping finger -> tip index
+                    tip_map = {'thumb':4, 'index':8, 'middle':12, 'ring':16, 'pinky':20}
+                    for fname, tidx in tip_map.items():
+                        pt = (int(lm[tidx].x * frame.shape[1]), int(lm[tidx].y * frame.shape[0]))
+                        # smoothed majority
+                        buff = tracked_hands[best_id]['finger_buffers'][fname]
+                        val = False
+                        if len(buff) > 0:
+                            val = (Counter(buff).most_common(1)[0][0] == 1)
+                        color = (0, 255, 0) if val else (0, 0, 255)
+                        cv2.circle(frame, pt, 8, color, -1)
+                    # label extended finger names
+                    smoothed = [fname for fname, b in tracked_hands[best_id]['finger_buffers'].items() if len(b)>0 and Counter(b).most_common(1)[0][0]==1]
+                    lbl = ",".join([s[0].upper() for s in smoothed]) if smoothed else ""
+                    if lbl:
+                        x1, y1, x2, y2 = tracked_hands[best_id]['bbox']
+                        cv2.putText(frame, lbl, (x1, y2 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+                except Exception:
+                    pass
+            else:
+                # create new tracked hand
+                fid = next_hand_id
+                next_hand_id += 1
+                buffers = {f: deque(maxlen=5) for f in ['thumb','index','middle','ring','pinky']}
+                tracked_hands[fid] = {
+                    'bbox': dbbox,
+                    'last_seen': frame_idx,
+                    'label': det.get('handedness'),
+                    'finger_buffers': buffers
+                }
+                # seed buffers
+                states, cnt = detect_fingers(det['landmarks'], det.get('handedness'), thumb_angle_threshold)
+                for fname, val in states.items():
+                    tracked_hands[fid]['finger_buffers'][fname].append(int(bool(val)))
+                # draw
+                draw_hand_landmarks(frame, det['landmarks'], det.get('confidence'))
+
+        # Age out old hand tracks
+        old_hids = [hid for hid, t in tracked_hands.items() if (frame_idx - t['last_seen']) > track_max_age]
+        for hid in old_hids:
+            try:
+                del tracked_hands[hid]
+            except KeyError:
+                pass
+
+        # Count open/closed hands from smoothed buffers and draw small labels
+        for hid, t in tracked_hands.items():
+            # only consider recently-seen tracks
+            if (frame_idx - t['last_seen']) > 1:
+                continue
+            smoothed_states = {}
+            for fname, buff in t['finger_buffers'].items():
+                if len(buff) == 0:
+                    smoothed_states[fname] = False
+                else:
+                    smoothed_states[fname] = (Counter(buff).most_common(1)[0][0] == 1)
+            smoothed_count = sum(1 for v in smoothed_states.values() if v)
+            if smoothed_count >= 4:
+                open_hands += 1
+            elif smoothed_count <= 1:
+                closed_hands += 1
 
         # Per-face tracking + smoothing: convert detections to pixel bboxes and match to tracked faces
         frame_idx += 1
@@ -460,15 +665,32 @@ def run_hand_detector(camera_index=0):
                 current_seen += 1
             x1, y1, x2, y2 = t["bbox"]
             color = (255, 0, 0)
+            # Draw face bbox outline
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            # Draw semi-transparent label background so it doesn't completely obscure underlying drawings (e.g. hands)
             label = f"Face #{tid} {int(t.get('score',0)*100)}%"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-            cv2.rectangle(frame, (x1, max(0, y1 - th - 8)), (x1 + tw + 8, y1), color, -1)
+            label_overlay = frame.copy()
+            cv2.rectangle(label_overlay, (x1, max(0, y1 - th - 8)), (x1 + tw + 8, y1), color, -1)
+            cv2.addWeighted(label_overlay, 0.45, frame, 0.55, 0, frame)
             cv2.putText(frame, label, (x1 + 4, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
 
         # Display the number of currently-seen faces
         cv2.putText(frame, f"Faces detected: {current_seen}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
                     0.7, (255, 128, 0), 2, cv2.LINE_AA)
+
+        # Play a different sound when face count changes (with cooldown) so user gets audio feedback
+        try:
+            current_time = time.time()
+            if current_seen != previous_face_count and (current_time - last_face_sound_time) >= face_sound_cooldown:
+                if current_seen > 0:
+                    # 659 Hz (E5) for face appear
+                    winsound.Beep(659, 150)
+                last_face_sound_time = current_time
+                previous_face_count = current_seen
+        except Exception:
+            # If winsound or timing fails, don't crash the app
+            pass
 
         # Draw open/closed counts at the top-right
         status_label = f"Open: {open_hands}  Closed: {closed_hands}"
