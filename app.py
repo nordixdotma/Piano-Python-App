@@ -215,16 +215,31 @@ def run_hand_detector(camera_index=0):
         cv2.addWeighted(label_overlay, 0.6, frame, 0.4, 0, frame)
         cv2.putText(frame, status_label, (x, y), font, font_scale, (0, 255, 255), thickness, cv2.LINE_AA)
 
-        cv2.imshow(window_name, frame)
-
-        # If the user clicked the window's close (X) button, stop the loop
-        # cv2.getWindowProperty returns <1 when the window is closed
+        # Before showing the frame, check whether the user closed the window
+        # in the previous iteration. If we detect the window no longer exists,
+        # break before calling cv2.imshow() — otherwise imshow() will recreate
+        # the window and the program will continue running (this is why the
+        # close (X) button sometimes appears to not quit the app).
         try:
             if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
                 break
         except Exception:
             # Some backends may not support getWindowProperty; ignore and continue
             pass
+
+        # Windows-specific check: if the window handle no longer exists
+        # (user closed it using the window manager) then exit. We do this
+        # before imshow so the window isn't recreated by imshow().
+        try:
+            hwnd = ctypes.windll.user32.FindWindowW(None, window_name)
+            if not hwnd:
+                break
+        except Exception:
+            # If ctypes or FindWindowW fails for any reason, ignore — we already
+            # attempted a generic check above.
+            pass
+
+        cv2.imshow(window_name, frame)
 
         # Try to bring the window to the foreground once (Windows only)
         if not brought_to_front:
