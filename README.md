@@ -1,24 +1,22 @@
-```markdown
 # Piano Hand Detector (Python + OpenCV + MediaPipe)
 
-This is a simple desktop app that detects hands from your webcam and draws landmarks and a bounding box. It beeps when a hand appears, and shows how many hands are open vs closed in the top-right of the camera window.
+This is a simple desktop app that detects hands and faces from your webcam and draws landmarks and semi-transparent bounding boxes. It plays a beep when a hand reliably appears and shows counts for hands and faces. You can tune detection thresholds and smoothing at runtime using the built-in Settings panel.
 
-Features
-- Detects up to two hands using MediaPipe Hands
-- Draws landmarks and a semi-transparent bounding box
-- Plays a sound when a new hand reliably appears (debounced)
-- Shows counts for "Open" and "Closed" hands in the top-right
-- Brings the camera window to the foreground on Windows and supports closing via the window close (X) button or pressing `q`
+Key features
+- Hand detection (MediaPipe Hands) with improved finger/thumb detection (angle-based thumb heuristic).
+- Face detection (MediaPipe Face Detection) with per-face tracking and smoothed bounding boxes.
+- Runtime Settings UI (OpenCV trackbars) to tune detection confidences, thumb angle threshold and face smoothing without restarting.
+- Visual overlays and simple audio feedback when hands appear.
 
 Requirements
-- Windows with a webcam (features use Windows APIs to bring window forward)
-- Python 3.8+
-- Packages in `requirements.txt` (OpenCV, MediaPipe, numpy, etc.)
+- Windows with a webcam (the app includes Windows-specific code to bring the window forward).
+- Python 3.8+ (3.8–3.11 recommended).
+- Packages in `requirements.txt` (OpenCV, MediaPipe, numpy).
 
 Installation (PowerShell)
 ```powershell
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -r .\requirements.txt
 ```
 
 Run
@@ -26,28 +24,31 @@ Run
 python .\app.py
 ```
 
-Controls
-- Click "Yes" on the camera permission dialog when prompted.
-- The app window will open (it should be brought to the foreground automatically on Windows).
-- Press `q` in the camera window to quit, or click the window close (X) button.
+Usage
+- When launched you'll be asked for camera permission (simple tkinter prompt). Click Yes to continue.
+- The camera window opens and a separate "Settings" window appears with sliders:
+  - Hand Det % — MediaPipe Hands detection confidence (0–100%).
+  - Hand Track % — MediaPipe Hands tracking confidence (0–100%).
+  - Face Det % — MediaPipe Face Detection confidence (0–100%).
+  - Thumb Angle — angle threshold in degrees used to decide if a thumb is extended (higher = stricter).
+  - Face Smooth N — number of frames used for face smoothing (higher = smoother but slower to react).
+- Change sliders at runtime — the app recreates detectors with the new thresholds automatically.
+- Press `q` in the camera window to quit.
 
-What the overlays mean
-- "Hands detected: N" (top-left) — the stable number of hands detected (uses a short temporal buffer to avoid flicker).
-- "Open: X  Closed: Y" (top-right) — counts of hands detected as open (palm) vs closed (fist) using a simple finger-count heuristic.
+What to expect
+- Hands: landmarks and hand bounding boxes are drawn. Open/Closed counts use a finger-count heuristic with an improved geometric thumb test.
+- Faces: each face is assigned a small track ID (Face #N) and a smoothed bounding box to reduce jitter. The number of currently-detected faces is shown on-screen.
 
 Troubleshooting
-- If the camera doesn't open, make sure no other app is using it and that Windows privacy settings allow camera access.
-- If detection is noisy, try moving to better lighting or tweak parameters in `app.py` (buffer size, required stable frames, cooldown).
+- If the camera doesn't open, close apps that may be using the camera and verify Windows privacy settings.
+- If pip fails to install `mediapipe`, ensure you're using a supported Python version and have an up-to-date pip. Some Windows users may need Visual C++ build tools installed for certain wheels.
 
-Tuning
-- At the top of `app.py` you can find parameters to tune responsiveness vs stability:
-	- `stable_buffer` size and `stable_required` (how many frames must agree)
-	- `sound_cooldown` (minimum seconds between beeps)
+Notes & future improvements
+- The thumb detection uses a simple geometric angle; for maximum accuracy you can further combine multiple joint angles or train a small classifier.
+- Face tracking uses centroid matching + EMA for smoothing. For robust multi-face tracking you could add IoU matching and identity persistence across occlusions.
 
 Privacy
-- This app runs locally and uses your webcam. It does not send frames over the network.
+- This app runs locally and does not transmit frames over the network.
 
 License
 - MIT-style (adjust as needed)
-
-```
